@@ -41,7 +41,7 @@ impl Display for _Error {
 
 pub(crate) type _Result<T> = Result<T, _Error>;
 
-/// Configuration for `jobs::start_work`
+/// Configuration for `start_work`
 #[derive(Clone)]
 pub struct WorkConf {
     pub(crate) valkey_uri: String,
@@ -94,7 +94,7 @@ impl WorkConfBuilder {
 
     /// Max attempts to process a task
     /// Default is 1
-    /// Retries only occur when task fail with `jobs::JobTaskError::CanRetry`
+    /// Retries only occur when task fail with `JobTaskError::CanRetry`
     pub fn max_task_attempts(mut self, max_task_attempts: usize) -> Self {
         self.max_task_attempts = Some(max_task_attempts);
         self
@@ -195,7 +195,7 @@ pub(crate) fn stream_watch_key(stream: &str) -> String {
     format!("{stream}|watch")
 }
 
-/// Running job information returned by `jobs::Client::get_job_stats`
+/// Running job information returned by `crate::Client::get_job_stats`
 #[derive(Default)]
 pub struct JobStats {
     pub started_at: String,

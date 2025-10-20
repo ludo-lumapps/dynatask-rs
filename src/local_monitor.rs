@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::shared::{_Result, GROUP, JobTaskIds, stream_key};
-use crate::valkey_stuff::get_conn;
+use crate::valkey_utils::get_conn;
 
 const LOCAL_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
 

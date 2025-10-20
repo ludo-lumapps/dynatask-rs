@@ -12,12 +12,12 @@ use crate::shared::{
     _Result, JobStats, WorkConf, active_job_ids_key, stream_watch_key,
     stopping_job_ids_key, stream_key,
 };
-use crate::valkey_stuff::{GroupInfo, get_conn};
+use crate::valkey_utils::{GroupInfo, get_conn};
 
 const GLOBAL_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Information sent when calling `job_finished_callback`, if one is provided when
-/// calling `jobs::start_work`.
+/// calling `start_work`.
 #[derive(Default)]
 pub struct FinishedJobInfo {
     pub id: i32,

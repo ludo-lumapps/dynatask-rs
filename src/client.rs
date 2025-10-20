@@ -12,11 +12,11 @@ use crate::shared::{
     GROUP, JobStats, active_job_ids_key, job_spans_key, job_stats_key,
     stopping_job_ids_key, stream_key,
 };
-use crate::valkey_stuff::{EntryId, get_conn};
+use crate::valkey_utils::{EntryId, get_conn};
 pub(crate) const MAX_PAYLOAD_SIZE: usize = 10_000;
 
 
-/// Errors returned by `jobs::Client`
+/// Errors returned by `crate::Client`
 #[derive(Debug)]
 pub enum JobClientError {
     Unhandled { msg: String },
@@ -222,7 +222,7 @@ pub mod in_task_context {
     use crate::shared::{
         TASK_CONTEXT, job_spans_key, job_stats_key, stopping_job_ids_key, stream_key,
     };
-    use crate::valkey_stuff::EntryId;
+    use crate::valkey_utils::EntryId;
 
     use super::{Jcr, JobClientError, add_task_to_pipeline};
 

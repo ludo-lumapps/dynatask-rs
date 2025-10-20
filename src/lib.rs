@@ -2,7 +2,7 @@ mod client;
 mod global_monitor;
 mod local_monitor;
 mod shared;
-mod valkey_stuff;
+mod valkey_utils;
 mod work;
 mod workers;
 
