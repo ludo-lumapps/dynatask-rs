@@ -1,0 +1,24 @@
+[package]
+name = "dynatask"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+
+[dependencies]
+tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+rand = "0.9.2"
+tokio = { version = "1.48.0", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+] }
+chrono = { version = "0.4.42", default-features = false, features = ["std", "now"] }
+flate2 = { version = "1.1.4" }
+redis = { version = "0.32.7", default-features = false, features = ["tokio-comp", "connection-manager"] }
+
+[dev-dependencies]
+testcontainers = "0.25.0"
+tracing-subscriber = "0.3.20"
+serde = "1.0.228"
+serde_json = "1.0.145"
