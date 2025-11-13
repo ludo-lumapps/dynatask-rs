@@ -13,7 +13,7 @@ use crate::shared::{
     stopping_job_ids_key, stream_key,
 };
 use crate::valkey_utils::{EntryId, get_conn};
-pub(crate) const MAX_PAYLOAD_SIZE: usize = 10_000;
+pub(crate) const MAX_PAYLOAD_SIZE: usize = 50_000;
 
 
 /// Errors returned by `crate::Client`

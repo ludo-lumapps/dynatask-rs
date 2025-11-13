@@ -1,4 +1,3 @@
-# pre-commit install
 echo "alias ll='ls -l'" >> ~/.bashrc
 echo "alias ccb='clear && cargo build'" >> ~/.bashrc
 echo "alias ccc='clear && cargo clippy'" >> ~/.bashrc
