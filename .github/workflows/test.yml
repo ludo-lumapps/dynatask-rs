@@ -9,7 +9,7 @@ jobs:
     # Define the service container here
     services:
       valkey:
-        image: valkey:9.0.0-alpine
+        image: valkey/valkey:9.0.0-alpine
         # Map port 6379 on the container to port 6379 on the Docker host
         ports:
           - 6379:6379
