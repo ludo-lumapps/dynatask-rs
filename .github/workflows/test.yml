@@ -1,0 +1,37 @@
+name: System Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Define the service container here
+    services:
+      valkey:
+        image: valkey:9.0.0-alpine
+        # Map port 6379 on the container to port 6379 on the Docker host
+        ports:
+          - 6379:6379
+        # Health check to ensure valkey is up before running tests
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Cargo Test
+        run: cargo test
+        env:
+          # Rust will access Redis via localhost:6379
+          REDIS_URL: redis://127.0.0.1:6379/

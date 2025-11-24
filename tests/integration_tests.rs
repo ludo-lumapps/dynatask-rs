@@ -4,17 +4,10 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use rand::random_range;
-use redis::Client;
 use redis::aio::ConnectionManager;
-use redis::cmd;
+use redis::{Client, cmd};
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, json, to_vec};
-use testcontainers::ContainerAsync;
-use testcontainers::{
-    GenericImage,
-    core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
-};
 use tokio::spawn;
 use tokio::time::sleep;
 use tracing::level_filters::LevelFilter;
@@ -162,23 +155,8 @@ async fn job_is_done(job_info: FinishedJobInfo) {
     debug!("set_job_to_done invoked for job id: {}", job_info.id);
 }
 
-const REDIS_PORT: u16 = 6379;
-
-async fn start_valkey_image() -> ContainerAsync<GenericImage> {
-    GenericImage::new("valkey/valkey", "8.1.4")
-        // GenericImage::new("redis", "7.2.4")
-        .with_exposed_port(REDIS_PORT.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .start()
-        .await
-        .unwrap()
-}
-
-async fn get_valkey_uri(container: &ContainerAsync<GenericImage>) -> String {
-    let host = container.get_host().await.unwrap();
-    let host_port = container.get_host_port_ipv4(REDIS_PORT).await.unwrap();
-    let url = format!("redis://{host}:{host_port}");
-    url
+fn get_valkey_uri() -> &'static str {
+    "redis://127.0.0.1:6379"
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -190,9 +168,8 @@ async fn test_with_tasks_tracking_two_work_threads() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_with_tasks_tracking() {
     setup();
-    let valkey_container = start_valkey_image().await;
-    let valkey_uri = get_valkey_uri(&valkey_container).await;
-    let valkey_context = ValkeyContext::new(&valkey_uri).await;
+    let valkey_uri = get_valkey_uri();
+    let valkey_context = ValkeyContext::new(valkey_uri).await;
     debug!("Valkey container created, URI is {valkey_uri}");
     valkey_context.reset_counter(COUNTER_KEY).await;
 
@@ -221,7 +198,7 @@ async fn test_with_tasks_tracking() {
         Ok(())
     };
     let conf =
-        WorkConfBuilder::new(valkey_uri.clone(), JOB_TYPE.into(), LOCAL_TASK_TYPE.into()).build();
+        WorkConfBuilder::new(valkey_uri.into(), JOB_TYPE.into(), LOCAL_TASK_TYPE.into()).build();
     let exit_flag = Arc::new(AtomicBool::new(false));
     let work = start_work(
         conf,
@@ -235,7 +212,7 @@ async fn test_with_tasks_tracking() {
     let method = MyMethod::FooAll {
         item_count: item_count_orig,
     };
-    let data = to_vec(&json!({"context": MyContext {project_id: 1234, valkey_uri: valkey_uri.clone() }, "method": method})).unwrap();
+    let data = to_vec(&json!({"context": MyContext {project_id: 1234, valkey_uri: valkey_uri.into() }, "method": method})).unwrap();
 
     let jobs_client = dynatask::Client::new(&valkey_uri, JOB_TYPE.into(), &["default"]).await;
     jobs_client.start_job(1234, "default", &data).await.unwrap();
@@ -253,15 +230,14 @@ async fn test_with_tasks_tracking() {
 #[tokio::test]
 async fn test_watch() {
     setup();
-    let valkey_container = start_valkey_image().await;
-    let valkey_uri = get_valkey_uri(&valkey_container).await;
+    let valkey_uri = get_valkey_uri();
     debug!("Valkey container created, URI is {valkey_uri}");
 
-    let cli1 = redis::Client::open(valkey_uri.as_str()).expect("Error creating Valkey client");
+    let cli1 = redis::Client::open(valkey_uri).expect("Error creating Valkey client");
     let mut mgr1 = redis::aio::ConnectionManager::new(cli1)
         .await
         .expect("Error creating Valkey connection manager");
-    let cli2 = redis::Client::open(valkey_uri.as_str()).expect("Error creating Valkey client");
+    let cli2 = redis::Client::open(valkey_uri).expect("Error creating Valkey client");
     let mut mgr2 = redis::aio::ConnectionManager::new(cli2)
         .await
         .expect("Error creating Valkey connection manager");
