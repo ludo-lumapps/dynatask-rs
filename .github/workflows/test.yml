@@ -33,5 +33,4 @@ jobs:
       - name: Run Cargo Test
         run: cargo test
         env:
-          # Rust will access Redis via localhost:6379
           REDIS_URL: redis://127.0.0.1:6379/

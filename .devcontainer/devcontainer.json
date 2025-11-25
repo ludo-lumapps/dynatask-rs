@@ -1,18 +1,8 @@
-// For format details, see https://aka.ms/devcontainer.json. For config options, see the
-// README at: https://github.com/devcontainers/templates/tree/main/src/debian
 {
 	"name": "dynatask-rs",
-	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
 	"build": {
 		"dockerfile": "Dockerfile"
 	},
-	// Features to add to the dev container. More info: https://containers.dev/features.
-	"features": {
-		// "./docker-outside-of-docker": {}
-	},
-	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [],
-	// Configure tool-specific properties.
 	"customizations": {
 		"vscode": {
 			"extensions": [
@@ -29,9 +19,7 @@
 				}
 			}
 		}
-		// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
-		// "remoteUser": "root"
-		// Use 'postCreateCommand' to run commands after the container is created.
 	},
-	"postCreateCommand": "bash .devcontainer/post_install.sh"
+	"postCreateCommand": "bash .devcontainer/post_install.sh",
+	"postStartCommand": "sudo service valkey-server start"
 }

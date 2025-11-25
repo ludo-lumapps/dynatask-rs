@@ -33,11 +33,15 @@ fn setup_logging() {
 
 static JOB_TYPE: &str = "test_job_trackers";
 static LOCAL_TASK_TYPE: &str = "default";
-static COUNTER_KEY: &str = "TEST_WITH_TRACKING_COUNTER";
+
+fn get_valkey_uri() -> String {
+    std::env::var("VALKEY_URI").unwrap_or_else(|_| "redis://127.0.0.1:6379/3".to_owned())
+}
 
 #[derive(Clone)]
-struct ValkeyContext {
+struct ValkeyCounter {
     valkey_pool: ConnectionManager,
+    key: String,
 }
 
 fn get_valkey_cli(valkey_uri: &str) -> Client {
@@ -51,10 +55,12 @@ async fn get_valkey_pool(valkey_uri: &str) -> ConnectionManager {
         .unwrap()
 }
 
-impl ValkeyContext {
-    async fn new(valkey_uri: &str) -> Self {
+impl ValkeyCounter {
+    async fn new(key: String) -> Self {
+        let valkey_uri = get_valkey_uri();
         Self {
-            valkey_pool: get_valkey_pool(valkey_uri).await,
+            valkey_pool: get_valkey_pool(&valkey_uri).await,
+            key,
         }
     }
 
@@ -62,26 +68,37 @@ impl ValkeyContext {
         self.valkey_pool.clone()
     }
 
-    async fn reset_counter(&self, key: &str) {
+    async fn reset(&self) {
         if let Err(err) = cmd("SET")
-            .arg(key)
+            .arg(&self.key)
             .arg(0)
             .exec_async(&mut self.get_conn().await)
             .await
         {
-            warn!("Error resetting counter {key}: {err}")
+            warn!("Error resetting counter {}: {err}", self.key)
         }
     }
 
-    async fn get_counter(&self, key: &str) -> i32 {
+    async fn incr(&self, by: i32) {
+        if let Err(err) = cmd("INCRBY")
+            .arg(&self.key)
+            .arg(by)
+            .exec_async(&mut self.get_conn().await)
+            .await
+        {
+            warn!("Error increasing counter {}: {err}", self.key)
+        }
+    }
+
+    async fn get(&self) -> i32 {
         let v: Option<i32> = match cmd("GET")
-            .arg(key)
+            .arg(&self.key)
             .query_async(&mut self.get_conn().await)
             .await
         {
             Ok(v) => v,
             Err(err) => {
-                warn!("Error getting counter {key}: {err}");
+                warn!("Error getting counter {}: {err}", self.key);
                 return 0;
             }
         };
@@ -99,7 +116,7 @@ enum MyMethod {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MyContext {
     project_id: i32,
-    valkey_uri: String,
+    counter_key: String,
 }
 
 struct MyTask {
@@ -107,17 +124,6 @@ struct MyTask {
 }
 
 impl MyTask {
-    async fn incr_counter(&self, key: &str, by: i32) {
-        if let Err(err) = cmd("INCRBY")
-            .arg(key)
-            .arg(by)
-            .exec_async(&mut get_valkey_pool(&self.ctxt.valkey_uri).await)
-            .await
-        {
-            warn!("Error increasing counter {key}: {err}")
-        }
-    }
-
     async fn foo_all(&self, item_count: i32) {
         debug!(
             "FooAll method invoked, project_id is: {}",
@@ -146,17 +152,16 @@ impl MyTask {
         debug!("Sleeping {nb_secs} seconds");
         sleep(Duration::from_secs(nb_secs)).await;
         debug!("Task is done sleeping");
-        self.incr_counter(COUNTER_KEY, 1).await;
+        ValkeyCounter::new(self.ctxt.counter_key.clone())
+            .await
+            .incr(1)
+            .await;
         debug!("Task is done");
     }
 }
 
 async fn job_is_done(job_info: FinishedJobInfo) {
     debug!("set_job_to_done invoked for job id: {}", job_info.id);
-}
-
-fn get_valkey_uri() -> &'static str {
-    "redis://127.0.0.1:6379"
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -168,11 +173,6 @@ async fn test_with_tasks_tracking_two_work_threads() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_with_tasks_tracking() {
     setup();
-    let valkey_uri = get_valkey_uri();
-    let valkey_context = ValkeyContext::new(valkey_uri).await;
-    debug!("Valkey container created, URI is {valkey_uri}");
-    valkey_context.reset_counter(COUNTER_KEY).await;
-
     let task_handler = move |data: Vec<u8>| async move {
         #[derive(Deserialize, Debug)]
         struct TaskData {
@@ -197,8 +197,12 @@ async fn test_with_tasks_tracking() {
         };
         Ok(())
     };
+    let counter_key = "TEST_WITH_TRACKING_COUNTER";
+    let valkey_uri = get_valkey_uri();
+    let valkey_context = ValkeyCounter::new(counter_key.into()).await;
+    valkey_context.reset().await;
     let conf =
-        WorkConfBuilder::new(valkey_uri.into(), JOB_TYPE.into(), LOCAL_TASK_TYPE.into()).build();
+        WorkConfBuilder::new(valkey_uri.clone(), JOB_TYPE.into(), LOCAL_TASK_TYPE.into()).build();
     let exit_flag = Arc::new(AtomicBool::new(false));
     let work = start_work(
         conf,
@@ -212,8 +216,8 @@ async fn test_with_tasks_tracking() {
     let method = MyMethod::FooAll {
         item_count: item_count_orig,
     };
-    let data = to_vec(&json!({"context": MyContext {project_id: 1234, valkey_uri: valkey_uri.into() }, "method": method})).unwrap();
-
+    let data =
+        to_vec(&json!({"context": MyContext {project_id:1234, counter_key: counter_key.into() }, "method": method})).unwrap();
     let jobs_client = dynatask::Client::new(&valkey_uri, JOB_TYPE.into(), &["default"]).await;
     jobs_client.start_job(1234, "default", &data).await.unwrap();
     while jobs_client.job_is_running(1234).await.unwrap() {
@@ -223,7 +227,7 @@ async fn test_with_tasks_tracking() {
     debug!("Waiting for worker to exit");
     let _ = workers_handle.await;
     debug!("Worker has exited");
-    let item_count_final = valkey_context.get_counter(COUNTER_KEY).await;
+    let item_count_final = valkey_context.get().await;
     assert_eq!(item_count_orig, item_count_final);
 }
 
@@ -231,14 +235,13 @@ async fn test_with_tasks_tracking() {
 async fn test_watch() {
     setup();
     let valkey_uri = get_valkey_uri();
-    debug!("Valkey container created, URI is {valkey_uri}");
 
-    let cli1 = redis::Client::open(valkey_uri).expect("Error creating Valkey client");
-    let mut mgr1 = redis::aio::ConnectionManager::new(cli1)
+    let cli1 = Client::open(valkey_uri.as_str()).expect("Error creating Valkey client");
+    let mut mgr1 = ConnectionManager::new(cli1)
         .await
         .expect("Error creating Valkey connection manager");
-    let cli2 = redis::Client::open(valkey_uri).expect("Error creating Valkey client");
-    let mut mgr2 = redis::aio::ConnectionManager::new(cli2)
+    let cli2 = Client::open(valkey_uri.as_str()).expect("Error creating Valkey client");
+    let mut mgr2 = ConnectionManager::new(cli2)
         .await
         .expect("Error creating Valkey connection manager");
 
