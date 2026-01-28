@@ -4,17 +4,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::spawn;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
+
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::global_monitor::{FinishedJobInfo, GlobalMonitor};
 use crate::local_monitor::LocalMonitor;
 use crate::shared::{JobTaskIds, WorkConf};
 use crate::workers::{JobTaskError, WorkDispatcher};
 
-
-/// Starts the differents tasks to process jobs
+/// Starts the different tasks to process jobs
 /// This is meant to be typically started from the main thread,
-/// but it can be run from any thread.
+/// but it can be run from any thread, say to run tests for example
 pub async fn start_work<FTaskHandler, FutTaskHandler, FJobIsDone, FutJobIsDone>(
     conf: WorkConf,
     job_finished_callback: Option<FJobIsDone>,
@@ -33,10 +35,32 @@ pub async fn start_work<FTaskHandler, FutTaskHandler, FJobIsDone, FutJobIsDone>(
     {
         let exit_flag = exit_flag.clone();
         spawn(async move {
-            if let Err(err) = tokio::signal::ctrl_c().await {
-                eprintln!("Unable to listen for shutdown signal: {err}");
+            #[cfg(unix)]
+            {
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        error!("Failed to register SIGTERM handler: {}", e);
+                        return;
+                    }
+                };
+
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Received SIGINT (Ctrl+C), shutting down...");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM, shutting down...");
+                    }
+                }
             }
-            exit_flag.swap(true, Ordering::Relaxed);
+            #[cfg(not(unix))]
+            {
+                if let Ok(()) = tokio::signal::ctrl_c().await {
+                    info!("Received SIGINT (Ctrl+C), shutting down...");
+                }
+            }
+            exit_flag.store(true, Ordering::Relaxed);
         });
     }
     let global_monitor_handle = {
