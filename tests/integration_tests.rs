@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use rand::random_range;
 use redis::aio::ConnectionManager;
 use redis::{Client, cmd};
 use serde::{Deserialize, Serialize};
@@ -148,7 +147,7 @@ impl MyTask {
             "FooItem item_id={item_id} invoked, project_id is: {}",
             self.ctxt.project_id
         );
-        let nb_secs = random_range(1..10);
+        let nb_secs = fastrand::u64(1..10);
         debug!("Sleeping {nb_secs} seconds");
         sleep(Duration::from_secs(nb_secs)).await;
         debug!("Task is done sleeping");

@@ -2,16 +2,15 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use redis::aio::ConnectionManager;
-use redis::{
-    Client, ErrorKind, FromRedisValue, RedisError, RedisResult, Value, cmd,
-    from_redis_value,
-};
+use redis::{Client, FromRedisValue, ParsingError, RedisResult, Value, cmd, from_redis_value};
 
 const MAX_ELAPSED_MS_S: &str = "60000";
 
 pub(crate) async fn get_conn(valkey_uri: &str) -> ConnectionManager {
     let cli = Client::open(valkey_uri).expect("Error creating REDIS client");
-    ConnectionManager::new(cli).await.expect("Error creating REDIS connection manager")
+    ConnectionManager::new(cli)
+        .await
+        .expect("Error creating REDIS connection manager")
 }
 
 #[derive(Default, Debug, PartialEq, Eq, Clone, Hash)]
@@ -22,8 +21,7 @@ pub(crate) struct EntryId {
 
 impl Ord for EntryId {
     fn cmp(&self, other: &Self) -> Ordering {
-        (&self.timestamp, self.sequence_number)
-            .cmp(&(&other.timestamp, other.sequence_number))
+        (&self.timestamp, self.sequence_number).cmp(&(&other.timestamp, other.sequence_number))
     }
 }
 
@@ -34,23 +32,26 @@ impl PartialOrd for EntryId {
 }
 
 impl EntryId {
-    fn from_str(s: &str) -> RedisResult<Self> {
+    fn from_str(s: &str) -> Result<Self, ParsingError> {
         if let Some((ts, sequence_number_s)) = s.split_once('-') {
             if let Ok(sequence_number) = sequence_number_s.parse() {
-                Ok(EntryId { timestamp: ts.into(), sequence_number })
+                Ok(EntryId {
+                    timestamp: ts.into(),
+                    sequence_number,
+                })
             } else {
-                Err((ErrorKind::TypeError, "bad sequence number").into())
+                Err("bad sequence number".into())
             }
         } else {
-            Err((ErrorKind::TypeError, "missing dash").into())
+            Err("missing dash".into())
         }
     }
 }
 
 impl FromRedisValue for EntryId {
-    fn from_redis_value(v: &Value) -> RedisResult<Self> {
+    fn from_redis_value(v: Value) -> Result<Self, ParsingError> {
         let v: String = from_redis_value(v)?;
-        Self::from_str(&v)
+        Ok(Self::from_str(&v)?)
     }
 }
 
@@ -93,10 +94,11 @@ pub(crate) struct Entries {
 }
 
 impl FromRedisValue for Entries {
-    fn from_redis_value(v: &Value) -> RedisResult<Self> {
-        let mut ret = Self { ..Default::default() };
-        type SRRows =
-            Vec<HashMap<String, Vec<HashMap<EntryId, HashMap<String, Vec<u8>>>>>>;
+    fn from_redis_value(v: Value) -> Result<Self, ParsingError> {
+        let mut ret = Self {
+            ..Default::default()
+        };
+        type SRRows = Vec<HashMap<String, Vec<HashMap<EntryId, HashMap<String, Vec<u8>>>>>>;
         let rows: SRRows = from_redis_value(v)?;
         for row in rows {
             for (_stream, vec_entries_map) in row {
@@ -144,7 +146,7 @@ impl PendingIdled {
     ) -> RedisResult<Option<Self>> {
         match cmd("XPENDING")
             .arg(&[stream, group, "IDLE", MAX_ELAPSED_MS_S, "-", "+", count])
-            .query_async::<Self>(conn)
+            .query_async(conn)
             .await
         {
             Ok(v) => Ok(Some(v)),
@@ -160,7 +162,7 @@ impl PendingIdled {
 }
 
 impl FromRedisValue for PendingIdled {
-    fn from_redis_value(v: &Value) -> RedisResult<Self> {
+    fn from_redis_value(v: Value) -> Result<Self, ParsingError> {
         let mut ret = Self::default();
         match v {
             Value::Array(outer_tuple) => {
@@ -168,25 +170,20 @@ impl FromRedisValue for PendingIdled {
                     match outer {
                         Value::Array(inner_tuple) => match &inner_tuple[..] {
                             [entry_id_v, _, _, Value::Int(times_delivered_u64)] => {
-                                let id: EntryId = from_redis_value(entry_id_v)?;
+                                let id: EntryId = from_redis_value(entry_id_v.clone())?;
                                 let times_delivered = *times_delivered_u64 as usize;
-                                ret.ids.push(PendingIdledEntry { id, times_delivered });
+                                ret.ids.push(PendingIdledEntry {
+                                    id,
+                                    times_delivered,
+                                });
                             }
-                            _ => Err(RedisError::from((
-                                ErrorKind::TypeError,
-                                "Can't parse redis data 3",
-                            )))?,
+                            _ => return Err("Can't parse redis data 3".into()),
                         },
-                        _ => Err(RedisError::from((
-                            ErrorKind::TypeError,
-                            "Can't parse redis data 2",
-                        )))?,
+                        _ => return Err("Can't parse redis data 2".into()),
                     }
                 }
             }
-            _ => {
-                Err(RedisError::from((ErrorKind::TypeError, "Can't parse redis data 1")))?
-            }
+            _ => return Err("Can't parse redis data 1".into()),
         };
         Ok(ret)
     }
@@ -198,13 +195,13 @@ pub(crate) struct GroupInfo {
 }
 
 impl FromRedisValue for GroupInfo {
-    fn from_redis_value(v: &Value) -> RedisResult<Self> {
-        let map: HashMap<String, Value> = from_redis_value(v)?;
-        let pending: Option<usize> = match map.get("pending") {
+    fn from_redis_value(v: Value) -> Result<Self, ParsingError> {
+        let mut map: HashMap<String, Value> = from_redis_value(v)?;
+        let pending: Option<usize> = match map.remove("pending") {
             Some(v) => from_redis_value(v)?,
             None => None,
         };
-        let lag: Option<usize> = match map.get("lag") {
+        let lag: Option<usize> = match map.remove("lag") {
             Some(v) => from_redis_value(v)?,
             None => None,
         };
@@ -247,7 +244,7 @@ impl ClaimedEntries {
 }
 
 impl FromRedisValue for ClaimedEntries {
-    fn from_redis_value(v: &Value) -> RedisResult<Self> {
+    fn from_redis_value(v: Value) -> Result<Self, ParsingError> {
         let rows: Vec<HashMap<EntryId, HashMap<String, Vec<u8>>>> = from_redis_value(v)?;
         let entries: Vec<Entry> = rows
             .into_iter()

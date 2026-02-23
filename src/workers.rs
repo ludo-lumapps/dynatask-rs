@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use fastrand::shuffle;
 use flate2::read::ZlibDecoder;
-use rand::seq::SliceRandom;
 use redis::aio::ConnectionManager;
 use redis::{RedisResult, Value, cmd, pipe};
 use tokio::spawn;
@@ -426,7 +426,7 @@ where
         }
         // srandmember_multiple results themselves are not shuffled
         let mut qts: Vec<QueuedTask> = vec![];
-        job_ids.shuffle(&mut rand::rng());
+        shuffle(&mut job_ids);
         for job_id in job_ids {
             let stream = stream_key(job_type, job_id, task_type);
             if self.is_stopping(job_id).await? {
