@@ -1,9 +1,11 @@
+use std::fmt::Display;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use redis::aio::ConnectionManager;
-use redis::pipe;
+use redis::{ToRedisArgs, pipe};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -12,24 +14,36 @@ use crate::valkey_utils::get_conn;
 
 const LOCAL_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
 
-pub(crate) struct LocalMonitor {
+pub(crate) struct LocalMonitor<T>
+where
+    T: Display + Clone + Eq + Hash + Send + Sync + ToRedisArgs + 'static,
+{
     conn: ConnectionManager,
     job_type: String,
     local_task_type: String,
     consumer: String,
-    running_tasks: Arc<Mutex<JobTaskIds>>,
+    running_tasks: Arc<Mutex<JobTaskIds<T>>>,
 }
 
-impl LocalMonitor {
+impl<T> LocalMonitor<T>
+where
+    T: Display + Clone + Eq + Hash + Send + Sync + ToRedisArgs + 'static,
+{
     pub async fn new(
         valkey_uri: &str,
         job_type: String,
         local_task_type: String,
         consumer: String,
-        running_tasks: Arc<Mutex<JobTaskIds>>,
+        running_tasks: Arc<Mutex<JobTaskIds<T>>>,
     ) -> Self {
         let conn = get_conn(valkey_uri).await;
-        Self { conn, job_type, local_task_type, consumer, running_tasks }
+        Self {
+            conn,
+            job_type,
+            local_task_type,
+            consumer,
+            running_tasks,
+        }
     }
 
     pub async fn start(&self, exit_flag: Arc<AtomicBool>) {
@@ -55,10 +69,10 @@ impl LocalMonitor {
         let mut p = pipe();
         let p2 = &mut p;
         for (job_id, ids) in running_tasks.iter() {
-            let stream = stream_key(&self.job_type, *job_id, &self.local_task_type);
+            let stream = stream_key(&self.job_type, job_id, &self.local_task_type);
             info!("Resetting entries in {stream}: {ids:?}");
             p2.cmd("XCLAIM")
-                .arg(stream)
+                .arg(&stream)
                 .arg(GROUP)
                 .arg(&self.consumer)
                 .arg("0")

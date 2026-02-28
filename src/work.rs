@@ -1,7 +1,10 @@
+use std::fmt::Display;
 use std::future::Future;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use redis::{FromRedisValue, ToRedisArgs};
 use tokio::spawn;
 use tokio::sync::Mutex;
 use tracing::{error, info};
@@ -17,15 +20,16 @@ use crate::workers::{JobTaskError, WorkDispatcher};
 /// Starts the different tasks to process jobs
 /// This is meant to be typically started from the main thread,
 /// but it can be run from any thread, say to run tests for example
-pub async fn start_work<FTaskHandler, FutTaskHandler, FJobIsDone, FutJobIsDone>(
+pub async fn start_work<T, FTaskHandler, FutTaskHandler, FJobIsDone, FutJobIsDone>(
     conf: WorkConf,
     job_finished_callback: Option<FJobIsDone>,
     task_handler: FTaskHandler,
     exit_flag: Option<Arc<AtomicBool>>,
 ) where
+    T: Display + Clone + Eq + Hash + Send + Sync + ToRedisArgs + FromRedisValue + 'static,
     FTaskHandler: Fn(Vec<u8>) -> FutTaskHandler + Copy + Sync + Send + 'static,
     FutTaskHandler: Future<Output = Result<(), JobTaskError>> + Send,
-    FJobIsDone: (Fn(FinishedJobInfo) -> FutJobIsDone) + Send + Sync + 'static,
+    FJobIsDone: (Fn(FinishedJobInfo<T>) -> FutJobIsDone) + Send + Sync + 'static,
     FutJobIsDone: Future<Output = ()> + Send + 'static,
 {
     let job_type = &conf.job_type;
@@ -69,7 +73,7 @@ pub async fn start_work<FTaskHandler, FutTaskHandler, FJobIsDone, FutJobIsDone>(
         let global_monitor = GlobalMonitor::new(conf, job_finished_callback).await;
         spawn(async move { global_monitor.start(exit_flag).await })
     };
-    let running_tasks = Arc::new(Mutex::new(JobTaskIds::new()));
+    let running_tasks = Arc::new(Mutex::new(JobTaskIds::<T>::new()));
     let local_monitor_handle = {
         let local_monitor = LocalMonitor::new(
             &conf.valkey_uri,
@@ -82,7 +86,7 @@ pub async fn start_work<FTaskHandler, FutTaskHandler, FJobIsDone, FutJobIsDone>(
         let exit_flag = exit_flag.clone();
         spawn(async move { local_monitor.start(exit_flag).await })
     };
-    let dispatcher = WorkDispatcher::<_, _>::new(conf, running_tasks, task_handler).await;
+    let dispatcher = WorkDispatcher::<T, _, _>::new(conf, running_tasks, task_handler).await;
     dispatcher.dispatch_work(exit_flag).await;
     let _ = global_monitor_handle.await;
     let _ = local_monitor_handle.await;

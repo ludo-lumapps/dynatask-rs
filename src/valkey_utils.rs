@@ -51,7 +51,7 @@ impl EntryId {
 impl FromRedisValue for EntryId {
     fn from_redis_value(v: Value) -> Result<Self, ParsingError> {
         let v: String = from_redis_value(v)?;
-        Ok(Self::from_str(&v)?)
+        Self::from_str(&v)
     }
 }
 

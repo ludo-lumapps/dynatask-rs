@@ -159,7 +159,7 @@ impl MyTask {
     }
 }
 
-async fn job_is_done(job_info: FinishedJobInfo) {
+async fn job_is_done(job_info: FinishedJobInfo<i32>) {
     debug!("set_job_to_done invoked for job id: {}", job_info.id);
 }
 

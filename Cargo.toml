@@ -21,3 +21,15 @@ redis = { version = "1.0", default-features = false, features = ["tokio-comp", "
 tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+large_types_passed_by_value = "warn"
+large_stack_arrays = "warn"
+await_holding_lock = "warn"

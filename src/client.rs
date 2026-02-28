@@ -5,16 +5,15 @@ use chrono::Utc;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use redis::aio::ConnectionManager;
-use redis::{Pipeline, RedisError, cmd, pipe};
+use redis::{Pipeline, RedisError, ToRedisArgs, cmd, pipe};
 use tracing::info;
 
 use crate::shared::{
-    GROUP, JobStats, active_job_ids_key, job_spans_key, job_stats_key,
-    stopping_job_ids_key, stream_key,
+    GROUP, JobStats, active_job_ids_key, job_spans_key, job_stats_key, stopping_job_ids_key,
+    stream_key,
 };
 use crate::valkey_utils::{EntryId, get_conn};
 pub(crate) const MAX_PAYLOAD_SIZE: usize = 50_000;
-
 
 /// Errors returned by `crate::Client`
 #[derive(Debug)]
@@ -25,7 +24,9 @@ pub enum JobClientError {
 
 impl From<RedisError> for JobClientError {
     fn from(e: RedisError) -> Self {
-        Self::Unhandled { msg: format!("valkey error: {e}") }
+        Self::Unhandled {
+            msg: format!("valkey error: {e}"),
+        }
     }
 }
 
@@ -58,8 +59,9 @@ fn compress_data(v: &[u8]) -> Jcr<Vec<u8>> {
 }
 
 fn prep_task_param(data: &[u8]) -> Jcr<Vec<u8>> {
-    let ret = compress_data(data)
-        .map_err(|e| JobClientError::Unhandled { msg: format!("{e}") })?;
+    let ret = compress_data(data).map_err(|e| JobClientError::Unhandled {
+        msg: format!("{e}"),
+    })?;
     let payload_size = ret.len();
     if payload_size > MAX_PAYLOAD_SIZE {
         Err(JobClientError::User {
@@ -69,9 +71,9 @@ fn prep_task_param(data: &[u8]) -> Jcr<Vec<u8>> {
     Ok(ret)
 }
 
-async fn add_task_to_pipeline(
+async fn add_task_to_pipeline<T: Display>(
     job_type: &str,
-    job_id: i32,
+    job_id: &T,
     stream: &str,
     stats_key: &str,
     data: &[u8],
@@ -80,7 +82,9 @@ async fn add_task_to_pipeline(
 ) -> Jcr<usize> {
     let spans_v = prep_task_param(spans.join("|").as_bytes())?;
     let data_v = prep_task_param(data)?;
-    p.cmd("XADD").arg(&[stream, "*"]).arg(&[("data", &data_v), ("spans", &spans_v)]);
+    p.cmd("XADD")
+        .arg(&[stream, "*"])
+        .arg(&[("data", &data_v), ("spans", &spans_v)]);
     p.cmd("HINCRBY").arg(&[stats_key, "added", "1"]).ignore();
     if !spans.is_empty() {
         let spans_key = job_spans_key(job_type, job_id);
@@ -91,7 +95,6 @@ async fn add_task_to_pipeline(
     }
     Ok(data_v.len())
 }
-
 
 /// Client that is used to:
 ///     - start jobs
@@ -116,10 +119,19 @@ impl Client {
         let active_job_ids_key = active_job_ids_key(job_type);
         let stopping_job_ids_key = stopping_job_ids_key(job_type);
         let conn = get_conn(valkey_uri).await;
-        Self { conn, job_type, task_types, active_job_ids_key, stopping_job_ids_key }
+        Self {
+            conn,
+            job_type,
+            task_types,
+            active_job_ids_key,
+            stopping_job_ids_key,
+        }
     }
 
-    pub async fn start_job(&self, job_id: i32, task_type: &str, data: &[u8]) -> Jcr<()> {
+    pub async fn start_job<T>(&self, job_id: T, task_type: &str, data: &[u8]) -> Jcr<()>
+    where
+        T: Display + ToRedisArgs + Clone,
+    {
         let job_type = &self.job_type;
         // 1- grab a lock
         let lock_key = format!("stream-creation|{job_type}|{job_id}");
@@ -130,36 +142,47 @@ impl Client {
             .await?
             .is_some()
         {
-            Err(JobClientError::User { msg: format!("Job {job_id} already running") })?
+            Err(JobClientError::User {
+                msg: format!("Job {job_id} already running"),
+            })?
         };
         // 2- check if job exists
         let exists: bool = cmd("SISMEMBER")
             .arg(&self.active_job_ids_key)
-            .arg(job_id)
+            .arg(job_id.clone())
             .query_async(&mut conn)
             .await?;
         if exists {
             cmd("DEL").arg(&lock_key).exec_async(&mut conn).await?;
-            Err(JobClientError::User { msg: format!("Job {job_id} already running") })?
+            Err(JobClientError::User {
+                msg: format!("Job {job_id} already running"),
+            })?
         }
-        let stats_key = job_stats_key(job_type, job_id);
+        let stats_key = job_stats_key(job_type, &job_id);
         let mut p = pipe();
         let p2 = &mut p;
         // 3- crate the new job
         p2.atomic();
         p2.cmd("DEL").arg(&stats_key).ignore();
-        p2.cmd("SADD").arg(&self.active_job_ids_key).arg(job_id).ignore();
-        p2.cmd("SREM").arg(&self.stopping_job_ids_key).arg(job_id).ignore();
+        p2.cmd("SADD")
+            .arg(&self.active_job_ids_key)
+            .arg(job_id.clone())
+            .ignore();
+        p2.cmd("SREM")
+            .arg(&self.stopping_job_ids_key)
+            .arg(job_id.clone())
+            .ignore();
         // add the streams
         for tt in self.task_types {
-            let stream = stream_key(job_type, job_id, tt);
-            p2.cmd("XGROUP").arg(&["CREATE", &stream, GROUP, "0", "MKSTREAM"]).ignore();
+            let stream = stream_key(job_type, &job_id, tt);
+            p2.cmd("XGROUP")
+                .arg(&["CREATE", &stream, GROUP, "0", "MKSTREAM"])
+                .ignore();
         }
         // add the task and release the lock
-        let stream = stream_key(job_type, job_id, task_type);
+        let stream = stream_key(job_type, &job_id, task_type);
         let pl_len =
-            add_task_to_pipeline(job_type, job_id, &stream, &stats_key, data, &[], p2)
-                .await?;
+            add_task_to_pipeline(job_type, &job_id, &stream, &stats_key, data, &[], p2).await?;
         /*
         started_at:
         2025-09-02 11:53:02.386920173 UTC
@@ -173,17 +196,15 @@ impl Client {
         p2.cmd("DEL").arg(&lock_key).ignore();
         let resp: (EntryId,) = p2.query_async(&mut conn).await?;
         let entry_id = resp.0;
-        info!(
-            "Added first task {entry_id} to stream {stream} of job {job_id}, size {pl_len}",
-        );
+        info!("Added first task {entry_id} to stream {stream} of job {job_id}, size {pl_len}",);
         Ok(())
     }
 
-    pub async fn stop_job(&self, job_id: i32) -> Jcr<bool> {
+    pub async fn stop_job<T: ToRedisArgs + Clone>(&self, job_id: T) -> Jcr<bool> {
         let mut conn = self.conn.clone();
         let is_member: bool = cmd("SISMEMBER")
             .arg(&self.active_job_ids_key)
-            .arg(job_id)
+            .arg(job_id.clone())
             .query_async(&mut conn)
             .await?;
         if is_member {
@@ -198,7 +219,7 @@ impl Client {
         }
     }
 
-    pub async fn job_is_running(&self, job_id: i32) -> Jcr<bool> {
+    pub async fn job_is_running<T: ToRedisArgs>(&self, job_id: T) -> Jcr<bool> {
         let mut conn = self.conn.clone();
         Ok(cmd("SISMEMBER")
             .arg(&self.active_job_ids_key)
@@ -207,7 +228,10 @@ impl Client {
             .await?)
     }
 
-    pub async fn get_job_stats(&self, job_id: i32) -> JobStats {
+    pub async fn get_job_stats<T>(&self, job_id: T) -> JobStats
+    where
+        T: Display + ToRedisArgs + Clone,
+    {
         JobStats::get(&mut self.conn.clone(), self.job_type, job_id).await
     }
 }
@@ -236,14 +260,16 @@ pub mod in_task_context {
         let task_context = TASK_CONTEXT.get();
         let mut conn = task_context.conn;
         let job_type = &task_context.job_type;
-        let job_id = task_context.job_id;
+        let job_id = &task_context.job_id; // 6. Grab a reference since it's a String now
         let stream = stream_key(job_type, job_id, task_type);
         let stats_key = job_stats_key(job_type, job_id);
         let mut p = pipe();
         let parent_spans = task_context.spans;
         let mut sub_task_spans = vec![];
         if let Some(parent_spans) = parent_spans {
-            parent_spans.into_iter().for_each(|s| sub_task_spans.push(s));
+            parent_spans
+                .into_iter()
+                .for_each(|s| sub_task_spans.push(s));
         }
         if track {
             sub_task_spans.push(task_context.task_id);
@@ -272,7 +298,7 @@ pub mod in_task_context {
         let mut task_context = TASK_CONTEXT.get();
         Ok(cmd("SISMEMBER")
             .arg(stopping_job_ids_key(&task_context.job_type))
-            .arg(task_context.job_id)
+            .arg(&task_context.job_id)
             .query_async(&mut task_context.conn)
             .await?)
     }
@@ -284,7 +310,7 @@ pub mod in_task_context {
         let mut task_context = TASK_CONTEXT.get();
         // tracked subtasks have been tagged with span value == this_task_id
         let task_count: Option<String> = cmd("HGET")
-            .arg(job_spans_key(&task_context.job_type, task_context.job_id))
+            .arg(job_spans_key(&task_context.job_type, &task_context.job_id))
             .arg(&task_context.task_id)
             .query_async(&mut task_context.conn)
             .await?;

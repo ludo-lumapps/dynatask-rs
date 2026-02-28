@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use std::hash::Hash;
 use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,7 @@ use std::time::Duration;
 use fastrand::shuffle;
 use flate2::read::ZlibDecoder;
 use redis::aio::ConnectionManager;
-use redis::{RedisResult, Value, cmd, pipe};
+use redis::{FromRedisValue, RedisResult, ToRedisArgs, Value, cmd, pipe};
 use tokio::spawn;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -18,13 +19,10 @@ use tokio::time::sleep;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::shared::{
-    _Error, _Result, GROUP, JobTaskIds, TASK_CONTEXT, TaskContext, WorkConf,
-    active_job_ids_key, job_spans_key, job_stats_key, stopping_job_ids_key, stream_key,
-    stream_watch_key,
+    _Error, _Result, GROUP, JobTaskIds, TASK_CONTEXT, TaskContext, WorkConf, active_job_ids_key,
+    job_spans_key, job_stats_key, stopping_job_ids_key, stream_key, stream_watch_key,
 };
-use crate::valkey_utils::{
-    ClaimedEntries, Entries, PendingIdled, PendingIdledEntry, get_conn,
-};
+use crate::valkey_utils::{ClaimedEntries, Entries, PendingIdled, PendingIdledEntry, get_conn};
 
 #[derive(Debug)]
 pub enum JobTaskError {
@@ -74,17 +72,17 @@ fn get_task_data(pl: &HashMap<String, Vec<u8>>) -> _Result<Vec<u8>> {
     Ok(ret)
 }
 
-struct QueuedTask {
-    job_id: i32,
+struct QueuedTask<T> {
+    job_id: T,
     id: String,
     payload: HashMap<String, Vec<u8>>,
 }
 
-async fn xack_entry(
+async fn xack_entry<T: Display + ToRedisArgs + Clone>(
     conn: &mut ConnectionManager,
     job_type: &str,
     local_task_type: &str,
-    job_id: i32,
+    job_id: &T,
     task_id: &str,
     spans: Option<&Vec<String>>,
     finished_ok: bool,
@@ -108,33 +106,36 @@ async fn xack_entry(
     p2.cmd("XACK").arg(&[&stream, GROUP, task_id]).ignore();
     p2.cmd("XDEL").arg(&[&stream, task_id]).ignore();
     let stats_key = job_stats_key(job_type, job_id);
-    p2.cmd("HINCRBY").arg(&[&stats_key, done_field, "1"]).ignore();
+    p2.cmd("HINCRBY")
+        .arg(&[&stats_key, done_field, "1"])
+        .ignore();
     p2.exec_async(conn).await?;
     Ok(())
 }
 
-async fn process_task<F, FFut>(
+async fn process_task<T, F, FFut>(
+    job_id: T,
     params: Vec<u8>,
     th: F,
-    running_tasks: Arc<Mutex<JobTaskIds>>,
+    running_tasks: Arc<Mutex<JobTaskIds<T>>>,
 ) -> _Result<()>
 where
+    T: Display + Clone + Eq + Hash + ToRedisArgs,
     F: Fn(Vec<u8>) -> FFut + Sync,
     FFut: Future<Output = Result<(), JobTaskError>> + Send,
 {
     let task_context = TASK_CONTEXT.get();
     let mut conn = task_context.conn;
     let job_type = &task_context.job_type;
-    let job_id = task_context.job_id;
     let task_id = &task_context.task_id;
     let task_type = &task_context.task_type;
-    info!("Processing job ID {job_id} / task ID {task_id} ");
+    info!("Processing job ID {job_id} / task ID {task_id}");
     {
         let mut running_tasks = running_tasks.lock().await;
         if let Some(ids) = running_tasks.get_mut(&job_id) {
             ids.push(task_id.into());
         } else {
-            running_tasks.insert(job_id, vec![task_id.into()]);
+            running_tasks.insert(job_id.clone(), vec![task_id.into()]);
         }
     }
     match (th)(params).await {
@@ -144,7 +145,7 @@ where
                 &mut conn,
                 job_type,
                 task_type,
-                job_id,
+                &job_id,
                 task_id,
                 task_context.spans.as_ref(),
                 true,
@@ -160,7 +161,7 @@ where
                 &mut conn,
                 job_type,
                 task_type,
-                job_id,
+                &job_id,
                 task_id,
                 task_context.spans.as_ref(),
                 false,
@@ -175,42 +176,45 @@ where
     Ok(())
 }
 
-pub(crate) struct WorkDispatcher<F, FFut>
+pub(crate) struct WorkDispatcher<T, F, FFut>
 where
+    T: Display + Clone + Eq + Hash + Send + Sync + ToRedisArgs + FromRedisValue + 'static,
     F: Fn(Vec<u8>) -> FFut + Copy + Sync + Send + 'static,
     FFut: Future<Output = Result<(), JobTaskError>> + Send,
 {
     conf: WorkConf,
     stopping_job_ids_key: String,
     conn: ConnectionManager,
-    running_tasks: Arc<Mutex<JobTaskIds>>,
+    running_tasks: Arc<Mutex<JobTaskIds<T>>>,
     task_handler: F,
 }
 
-impl<F, FFut> WorkDispatcher<F, FFut>
+impl<T, F, FFut> WorkDispatcher<T, F, FFut>
 where
+    T: Display + Clone + Eq + Hash + Send + Sync + ToRedisArgs + FromRedisValue + 'static,
     F: Fn(Vec<u8>) -> FFut + Copy + Sync + Send + 'static,
     FFut: Future<Output = Result<(), JobTaskError>> + Send,
 {
     pub async fn new(
         conf: WorkConf,
-        running_tasks: Arc<Mutex<JobTaskIds>>,
+        running_tasks: Arc<Mutex<JobTaskIds<T>>>,
         task_handler: F,
     ) -> Self {
         let conn = get_conn(&conf.valkey_uri).await;
         let stopping_job_ids_key = stopping_job_ids_key(&conf.job_type);
-        Self { conf, stopping_job_ids_key, conn, running_tasks, task_handler }
+        Self {
+            conf,
+            stopping_job_ids_key,
+            conn,
+            running_tasks,
+            task_handler,
+        }
     }
 
-    async fn clear_abandoned_tasks_of_stopping_job(
-        &self,
-        job_id: i32,
-        stream: &str,
-    ) -> _Result<()> {
+    async fn clear_abandoned_tasks_of_stopping_job(&self, job_id: &T, stream: &str) -> _Result<()> {
         // we don't need to handle spans when a job is stopping
         // just xack abandoned tasks
-        let Some(pels) =
-            PendingIdled::get(&mut self.conn.clone(), GROUP, stream, "10000").await?
+        let Some(pels) = PendingIdled::get(&mut self.conn.clone(), GROUP, stream, "10000").await?
         else {
             return Ok(()); // group gone, job was done
         };
@@ -233,9 +237,9 @@ where
     async fn get_next_pel_tasks(
         &self,
         free_slots: usize,
-        job_id: i32,
+        job_id: &T,
         stream: &str,
-        qts: &mut Vec<QueuedTask>,
+        qts: &mut Vec<QueuedTask<T>>,
     ) -> _Result<()> {
         let mut conn = self.conn.clone();
         // get up to `free_slots` tasks from the PEL
@@ -255,15 +259,17 @@ where
             return Ok(()); // nothing to claim
         }
         // this "pels -> pel_map -> pel_ids" needs to be simplified
-        let pel_map: HashMap<String, PendingIdledEntry> =
-            pels.ids.into_iter().map(|p| (p.id.to_string(), p)).collect();
+        let pel_map: HashMap<String, PendingIdledEntry> = pels
+            .ids
+            .into_iter()
+            .map(|p| (p.id.to_string(), p))
+            .collect();
         let pel_ids: Vec<&str> = pel_map.keys().map(|k| k.as_str()).collect();
         let consumer = &self.conf.consumer;
         // claim them all
         // if race occurs, those that got picked up in the
         //   meantime will NOT be returned by XCLAIM
-        let claimed =
-            ClaimedEntries::get(&mut conn, GROUP, stream, consumer, &pel_ids).await?;
+        let claimed = ClaimedEntries::get(&mut conn, GROUP, stream, consumer, &pel_ids).await?;
         let max_task_attempts = self.conf.max_task_attempts;
         let job_type = &self.conf.job_type;
         let task_type = &self.conf.local_task_type;
@@ -299,8 +305,15 @@ where
                 continue;
             }
             // queue the task to process it again
-            qts.push(QueuedTask { job_id, id: task_id, payload: entry.data });
-            info!("Entry {} of stream {stream} was claimed by {consumer}", entry.id);
+            qts.push(QueuedTask {
+                job_id: job_id.clone(),
+                id: task_id,
+                payload: entry.data,
+            });
+            info!(
+                "Entry {} of stream {stream} was claimed by {consumer}",
+                entry.id
+            );
             if qts.len() >= free_slots {
                 break;
             }
@@ -334,20 +347,26 @@ where
         stream: &str,
     ) -> RedisResult<usize> {
         type Inner = (usize, Value, Value, Value);
-        let res: Inner = cmd("XPENDING").arg(&[stream, GROUP]).query_async(conn).await?;
+        let res: Inner = cmd("XPENDING")
+            .arg(&[stream, GROUP])
+            .query_async(conn)
+            .await?;
         Ok(res.0)
     }
 
     async fn get_next_new_tasks(
         &self,
         free_slots: usize,
-        job_id: i32,
+        job_id: &T,
         stream: &str,
-        qts: &mut Vec<QueuedTask>,
+        qts: &mut Vec<QueuedTask<T>>,
     ) -> _Result<()> {
         let mut conn = self.conn.clone();
         let watch_key = stream_watch_key(stream);
-        cmd("WATCH").arg(&[&watch_key]).exec_async(&mut conn).await?;
+        cmd("WATCH")
+            .arg(&[&watch_key])
+            .exec_async(&mut conn)
+            .await?;
         let pending_count = self.get_pending_count(&mut conn, stream).await?;
         if pending_count >= self.conf.max_tasks_per_job {
             return Ok(());
@@ -389,7 +408,7 @@ where
         let read_count = entries_resp.1.entries.len();
         for entry in entries_resp.1.entries {
             qts.push(QueuedTask {
-                job_id,
+                job_id: job_id.clone(),
                 id: entry.id.to_string(),
                 payload: entry.data,
             });
@@ -403,21 +422,18 @@ where
         Ok(())
     }
 
-    async fn is_stopping(&self, job_id: i32) -> _Result<bool> {
+    async fn is_stopping(&self, job_id: &T) -> _Result<bool> {
         Ok(cmd("SISMEMBER")
             .arg(&self.stopping_job_ids_key)
-            .arg(job_id)
+            .arg(job_id.clone())
             .query_async(&mut self.conn.clone())
             .await?)
     }
 
-    async fn get_next_tasks(
-        &self,
-        free_slots: usize,
-    ) -> _Result<Option<Vec<QueuedTask>>> {
+    async fn get_next_tasks(&self, free_slots: usize) -> _Result<Option<Vec<QueuedTask<T>>>> {
         let job_type = &self.conf.job_type;
         let task_type = &self.conf.local_task_type;
-        let mut job_ids: Vec<i32> = cmd("SRANDMEMBER")
+        let mut job_ids: Vec<T> = cmd("SRANDMEMBER")
             .arg(&[&active_job_ids_key(job_type), "10"])
             .query_async(&mut self.conn.clone())
             .await?;
@@ -425,19 +441,22 @@ where
             return Ok(None);
         }
         // srandmember_multiple results themselves are not shuffled
-        let mut qts: Vec<QueuedTask> = vec![];
+        let mut qts: Vec<QueuedTask<T>> = vec![];
         shuffle(&mut job_ids);
         for job_id in job_ids {
-            let stream = stream_key(job_type, job_id, task_type);
-            if self.is_stopping(job_id).await? {
-                self.clear_abandoned_tasks_of_stopping_job(job_id, &stream).await?;
+            let stream = stream_key(job_type, &job_id, task_type);
+            if self.is_stopping(&job_id).await? {
+                self.clear_abandoned_tasks_of_stopping_job(&job_id, &stream)
+                    .await?;
                 continue;
             }
-            self.get_next_pel_tasks(free_slots, job_id, &stream, &mut qts).await?;
+            self.get_next_pel_tasks(free_slots, &job_id, &stream, &mut qts)
+                .await?;
             if qts.len() >= free_slots {
                 break;
             }
-            self.get_next_new_tasks(free_slots, job_id, &stream, &mut qts).await?;
+            self.get_next_new_tasks(free_slots, &job_id, &stream, &mut qts)
+                .await?;
             if qts.len() >= free_slots {
                 break;
             }
@@ -445,14 +464,14 @@ where
         Ok(Some(qts))
     }
 
-    async fn process_tasks(&self, qts: Vec<QueuedTask>, tasks: &mut Vec<JoinHandle<()>>) {
+    async fn process_tasks(&self, qts: Vec<QueuedTask<T>>, tasks: &mut Vec<JoinHandle<()>>) {
         let consumer = &self.conf.consumer;
         let job_type = &self.conf.job_type;
         let task_type = &self.conf.local_task_type;
         let th = self.task_handler;
         for qt in qts {
             let running_tasks = self.running_tasks.clone();
-            let job_id = qt.job_id;
+            let job_id = qt.job_id.clone();
             let task_id = qt.id.as_str();
             let spans = match get_task_spans(&qt.payload) {
                 Ok(v) => Some(v),
@@ -462,7 +481,7 @@ where
                         &mut self.conn.clone(),
                         job_type,
                         task_type,
-                        job_id,
+                        &job_id,
                         task_id,
                         None,
                         false,
@@ -486,7 +505,7 @@ where
                         &mut self.conn.clone(),
                         job_type,
                         task_type,
-                        job_id,
+                        &job_id,
                         task_id,
                         spans.as_ref(),
                         false,
@@ -501,7 +520,7 @@ where
             let task_context = TaskContext::new(
                 self.conn.clone(),
                 self.conf.job_type.clone(),
-                job_id,
+                job_id.clone(),
                 task_id.into(),
                 task_type.clone(),
                 spans.clone(),
@@ -510,7 +529,10 @@ where
             tasks.push(spawn(
                 async move {
                     if let Err(err) = TASK_CONTEXT
-                        .scope(task_context, process_task(params, th, running_tasks))
+                        .scope(
+                            task_context,
+                            process_task(job_id, params, th, running_tasks),
+                        )
                         .await
                     {
                         warn!("Worker error processing entry: {err}");

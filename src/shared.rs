@@ -4,10 +4,10 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use redis::aio::ConnectionManager;
-use redis::{RedisError, cmd};
+use redis::{RedisError, ToRedisArgs, cmd};
 use tokio::task_local;
 
-pub(crate) type JobTaskIds = HashMap<i32, Vec<String>>;
+pub(crate) type JobTaskIds<T> = HashMap<T, Vec<String>>;
 pub(crate) static GROUP: &str = "group-1";
 
 #[derive(Debug)]
@@ -142,16 +142,17 @@ impl WorkConfBuilder {
 pub(crate) struct TaskContext {
     pub conn: ConnectionManager,
     pub job_type: String,
-    pub job_id: i32,
+    pub job_id: String,
     pub task_id: String,
     pub task_type: String,
     pub spans: Option<Vec<String>>,
 }
+
 impl TaskContext {
-    pub fn new(
+    pub fn new<T: Display>(
         conn: ConnectionManager,
         job_type: String,
-        job_id: i32,
+        job_id: T,
         task_id: String,
         task_type: String,
         spans: Option<Vec<String>>,
@@ -159,7 +160,7 @@ impl TaskContext {
         Self {
             conn,
             job_type,
-            job_id,
+            job_id: job_id.to_string(),
             task_id,
             task_type,
             spans,
@@ -179,15 +180,15 @@ pub(crate) fn stopping_job_ids_key(job_type: &str) -> String {
     format!("{job_type}|stopping_jobs")
 }
 
-pub(crate) fn job_spans_key(job_type: &str, job_id: i32) -> String {
+pub(crate) fn job_spans_key<T: Display>(job_type: &str, job_id: &T) -> String {
     format!("{job_type}|{job_id}|spans")
 }
 
-pub(crate) fn job_stats_key(job_type: &str, job_id: i32) -> String {
+pub(crate) fn job_stats_key<T: Display>(job_type: &str, job_id: &T) -> String {
     format!("{job_type}|{job_id}|stats")
 }
 
-pub(crate) fn stream_key(job_type: &str, job_id: i32, task_type: &str) -> String {
+pub(crate) fn stream_key<T: Display>(job_type: &str, job_id: &T, task_type: &str) -> String {
     format!("{job_type}|{job_id}|{task_type}|stream")
 }
 
@@ -206,10 +207,13 @@ pub struct JobStats {
 }
 
 impl JobStats {
-    pub(crate) async fn get(conn: &mut ConnectionManager, job_type: &str, job_id: i32) -> Self {
+    pub(crate) async fn get<T>(conn: &mut ConnectionManager, job_type: &str, job_id: T) -> Self
+    where
+        T: Display + ToRedisArgs + Clone,
+    {
         let Ok(exists) = cmd("SISMEMBER")
             .arg(active_job_ids_key(job_type))
-            .arg(job_id)
+            .arg(job_id.clone())
             .query_async::<bool>(conn)
             .await
         else {
@@ -218,7 +222,7 @@ impl JobStats {
         if !exists {
             return Default::default();
         }
-        let stats_key = job_stats_key(job_type, job_id);
+        let stats_key = job_stats_key(job_type, &job_id);
         let Ok(Some(mut st)) = cmd("HGETALL")
             .arg(stats_key)
             .query_async::<Option<HashMap<String, String>>>(conn)

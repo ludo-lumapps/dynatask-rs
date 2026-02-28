@@ -1,16 +1,18 @@
+use std::fmt::Display;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use redis::aio::ConnectionManager;
-use redis::{cmd, pipe};
+use redis::{FromRedisValue, ToRedisArgs, cmd, pipe};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::shared::{
-    _Result, JobStats, WorkConf, active_job_ids_key, stream_watch_key,
-    stopping_job_ids_key, stream_key,
+    _Result, JobStats, WorkConf, active_job_ids_key, stopping_job_ids_key, stream_key,
+    stream_watch_key,
 };
 use crate::valkey_utils::{GroupInfo, get_conn};
 
@@ -19,8 +21,8 @@ const GLOBAL_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 /// Information sent when calling `job_finished_callback`, if one is provided when
 /// calling `start_work`.
 #[derive(Default)]
-pub struct FinishedJobInfo {
-    pub id: i32,
+pub struct FinishedJobInfo<T: Display> {
+    pub id: T,
     pub started_at: String,
     pub tasks_added: i32,
     pub tasks_read: i32,
@@ -28,26 +30,35 @@ pub struct FinishedJobInfo {
     pub tasks_done_err: i32,
 }
 
-pub(crate) struct GlobalMonitor<JobIsDone, JobIsDoneFut>
+pub(crate) struct GlobalMonitor<T, JobIsDone, JobIsDoneFut>
 where
-    JobIsDone: Fn(FinishedJobInfo) -> JobIsDoneFut + Send,
+    T: Display + Clone + ToRedisArgs + FromRedisValue + Send + Sync + 'static,
+    JobIsDone: Fn(FinishedJobInfo<T>) -> JobIsDoneFut + Send,
     JobIsDoneFut: Future<Output = ()> + Send + 'static,
 {
     conf: WorkConf,
     conn: ConnectionManager,
     job_is_done_handler: Option<JobIsDone>,
     throttle_key: String,
+    _phantom: PhantomData<T>,
 }
 
-impl<FJobIsDone, FutJobIsDone> GlobalMonitor<FJobIsDone, FutJobIsDone>
+impl<T, FJobIsDone, FutJobIsDone> GlobalMonitor<T, FJobIsDone, FutJobIsDone>
 where
-    FJobIsDone: Fn(FinishedJobInfo) -> FutJobIsDone + Send,
+    T: Display + Clone + ToRedisArgs + FromRedisValue + Send + Sync + 'static,
+    FJobIsDone: Fn(FinishedJobInfo<T>) -> FutJobIsDone + Send,
     FutJobIsDone: Future<Output = ()> + Send + 'static,
 {
     pub async fn new(conf: WorkConf, job_is_done_handler: Option<FJobIsDone>) -> Self {
         let throttle_key = format!("{}-jobs-monitor-throttle", conf.job_type);
         let conn = get_conn(&conf.valkey_uri).await;
-        Self { conf, conn, job_is_done_handler, throttle_key }
+        Self {
+            conf,
+            conn,
+            job_is_done_handler,
+            throttle_key,
+            _phantom: PhantomData,
+        }
     }
 
     pub async fn start(&self, exit_flag: Arc<AtomicBool>) {
@@ -61,19 +72,25 @@ where
         info!("Exiting global jobs monitor");
     }
 
-    async fn job_finished(&self, job_id: i32) -> _Result<()> {
+    async fn job_finished(&self, job_id: T) -> _Result<()> {
         let job_type = &self.conf.job_type;
-        let job_stats = JobStats::get(&mut self.conn.clone(), job_type, job_id).await;
+        let job_stats = JobStats::get(&mut self.conn.clone(), job_type, job_id.clone()).await;
         let streams: Vec<String> = self
             .conf
             .task_types
             .iter()
-            .map(|tt| stream_key(job_type, job_id, tt))
+            .map(|tt| stream_key(job_type, &job_id, tt))
             .collect();
         let mut p = redis::pipe();
         let p2 = &mut p;
-        p2.cmd("SREM").arg(active_job_ids_key(job_type)).arg(job_id).ignore();
-        p2.cmd("SREM").arg(stopping_job_ids_key(job_type)).arg(job_id).ignore();
+        p2.cmd("SREM")
+            .arg(active_job_ids_key(job_type))
+            .arg(job_id.clone())
+            .ignore();
+        p2.cmd("SREM")
+            .arg(stopping_job_ids_key(job_type))
+            .arg(job_id.clone())
+            .ignore();
         for stream in &streams {
             let watch_key = stream_watch_key(stream);
             p2.cmd("DEL").arg(watch_key).ignore();
@@ -94,7 +111,7 @@ where
         Ok(())
     }
 
-    async fn job_is_done(&self, job_id: i32) -> _Result<bool> {
+    async fn job_is_done(&self, job_id: &T) -> _Result<bool> {
         let job_type = &self.conf.job_type;
         let streams: Vec<String> = self
             .conf
@@ -106,7 +123,10 @@ where
         let p2 = &mut p;
         p2.cmd("WATCH").arg(&streams).ignore();
         p2.cmd("MULTI").ignore();
-        p2.cmd("SISMEMBER").arg(stopping_job_ids_key(job_type)).arg(job_id).ignore();
+        p2.cmd("SISMEMBER")
+            .arg(stopping_job_ids_key(job_type))
+            .arg(job_id.clone())
+            .ignore();
         for stream in &streams {
             p2.cmd("XINFO").arg(&["GROUPS", stream]).ignore();
         }
@@ -129,9 +149,9 @@ where
         Ok(true)
     }
 
-    async fn monitor_job(&self, job_id: i32) -> _Result<()> {
+    async fn monitor_job(&self, job_id: T) -> _Result<()> {
         info!("Monitoring job {job_id}");
-        if self.job_is_done(job_id).await? {
+        if self.job_is_done(&job_id).await? {
             info!("Job {job_id} has nothing left to do, time to end it");
             self.job_finished(job_id).await?;
         } else {
@@ -152,14 +172,19 @@ where
             // info!("Global monitor was throttled");
             return Ok(());
         };
+        // will automatically deserialize SMEMBERS into Vec<String> or Vec<i32>
+        // thanks to the FromRedisValue trait bound
         // info!("Global monitor was NOT throttled");
-        let job_ids: Vec<i32> = cmd("SMEMBERS")
+        let job_ids: Vec<T> = cmd("SMEMBERS")
             .arg(active_job_ids_key(&self.conf.job_type))
             .query_async(&mut conn)
             .await?;
         for job_id in job_ids {
             // SETEX key seconds value
-            cmd("SETEX").arg(&[throttle_key, "3", "1"]).exec_async(&mut conn).await?;
+            cmd("SETEX")
+                .arg(&[throttle_key, "3", "1"])
+                .exec_async(&mut conn)
+                .await?;
             self.monitor_job(job_id).await?;
         }
         Ok(())
