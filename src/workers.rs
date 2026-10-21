@@ -525,7 +525,12 @@ where
                 task_type.clone(),
                 spans.clone(),
             );
-            let trace_id = format!("worker-{consumer}-job-{job_id}-task-{task_id}");
+            let span = info_span!(
+                "dynatask_worker",
+                worker = %consumer,
+                job_id = %job_id,
+                task_id = %task_id
+            );
             tasks.push(spawn(
                 async move {
                     if let Err(err) = TASK_CONTEXT
@@ -538,7 +543,7 @@ where
                         warn!("Worker error processing entry: {err}");
                     }
                 }
-                .instrument(info_span!("trace_id", %trace_id)),
+                .instrument(span),
             ));
         }
     }
