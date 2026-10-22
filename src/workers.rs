@@ -19,8 +19,9 @@ use tokio::time::sleep;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::shared::{
-    _Error, _Result, GROUP, JobTaskIds, TASK_CONTEXT, TaskContext, WorkConf, active_job_ids_key,
-    job_spans_key, job_stats_key, stopping_job_ids_key, stream_key, stream_watch_key,
+    _Error, _Result, GROUP, JobTaskIds, PROCESS_JOB_TYPE, PROCESS_LOCAL_TASK_TYPE, TASK_CONTEXT,
+    TaskContext, WorkConf, active_job_ids_key, job_spans_key, job_stats_key, stopping_job_ids_key,
+    stream_key, stream_watch_key,
 };
 use crate::valkey_utils::{ClaimedEntries, Entries, PendingIdled, PendingIdledEntry, get_conn};
 
@@ -126,9 +127,13 @@ where
 {
     let task_context = TASK_CONTEXT.get();
     let mut conn = task_context.conn;
-    let job_type = &task_context.job_type;
+    let job_type = PROCESS_JOB_TYPE
+        .get()
+        .expect("PROCESS_JOB_TYPE must be set");
+    let task_type = PROCESS_LOCAL_TASK_TYPE
+        .get()
+        .expect("PROCESS_LOCAL_TASK_TYPE must be set");
     let task_id = &task_context.task_id;
-    let task_type = &task_context.task_type;
     info!("Processing job ID {job_id} / task ID {task_id}");
     {
         let mut running_tasks = running_tasks.lock().await;
@@ -519,10 +524,8 @@ where
             };
             let task_context = TaskContext::new(
                 self.conn.clone(),
-                self.conf.job_type.clone(),
                 job_id.clone(),
                 task_id.into(),
-                task_type.clone(),
                 spans.clone(),
             );
             let span = info_span!(

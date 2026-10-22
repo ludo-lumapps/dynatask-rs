@@ -9,7 +9,10 @@ use redis::{ToRedisArgs, pipe};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::shared::{_Result, GROUP, JobTaskIds, stream_key};
+use crate::shared::{
+    _Result, GROUP, JobTaskIds, PROCESS_CONSUMER, PROCESS_JOB_TYPE, PROCESS_LOCAL_TASK_TYPE,
+    stream_key,
+};
 use crate::valkey_utils::get_conn;
 
 const LOCAL_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
@@ -19,9 +22,6 @@ where
     T: Display + Clone + Eq + Hash + Send + Sync + ToRedisArgs + 'static,
 {
     conn: ConnectionManager,
-    job_type: String,
-    local_task_type: String,
-    consumer: String,
     running_tasks: Arc<Mutex<JobTaskIds<T>>>,
 }
 
@@ -29,19 +29,10 @@ impl<T> LocalMonitor<T>
 where
     T: Display + Clone + Eq + Hash + Send + Sync + ToRedisArgs + 'static,
 {
-    pub async fn new(
-        valkey_uri: &str,
-        job_type: String,
-        local_task_type: String,
-        consumer: String,
-        running_tasks: Arc<Mutex<JobTaskIds<T>>>,
-    ) -> Self {
+    pub async fn new(valkey_uri: &str, running_tasks: Arc<Mutex<JobTaskIds<T>>>) -> Self {
         let conn = get_conn(valkey_uri).await;
         Self {
             conn,
-            job_type,
-            local_task_type,
-            consumer,
             running_tasks,
         }
     }
@@ -66,15 +57,24 @@ where
         if running_tasks.is_empty() {
             return Ok(());
         }
+        let job_type = PROCESS_JOB_TYPE
+            .get()
+            .expect("PROCESS_JOB_TYPE must be set");
+        let consumer = PROCESS_CONSUMER
+            .get()
+            .expect("PROCESS_CONSUMER must be set");
+        let local_task_type = PROCESS_LOCAL_TASK_TYPE
+            .get()
+            .expect("PROCESS_LOCAL_TASK_TYPE must be set");
         let mut p = pipe();
         let p2 = &mut p;
         for (job_id, ids) in running_tasks.iter() {
-            let stream = stream_key(&self.job_type, job_id, &self.local_task_type);
+            let stream = stream_key(job_type, job_id, local_task_type);
             info!("Resetting entries in {stream}: {ids:?}");
             p2.cmd("XCLAIM")
                 .arg(&stream)
                 .arg(GROUP)
-                .arg(&self.consumer)
+                .arg(consumer)
                 .arg("0")
                 .arg(ids)
                 .arg("JUSTID")

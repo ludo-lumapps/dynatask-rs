@@ -244,11 +244,24 @@ pub mod in_task_context {
     use tracing::info;
 
     use crate::shared::{
-        TASK_CONTEXT, job_spans_key, job_stats_key, stopping_job_ids_key, stream_key,
+        PROCESS_CONSUMER, PROCESS_JOB_TYPE, TASK_CONTEXT, job_spans_key, job_stats_key,
+        stopping_job_ids_key, stream_key,
     };
     use crate::valkey_utils::EntryId;
 
     use super::{Jcr, JobClientError, add_task_to_pipeline};
+
+    pub fn get_task_id() -> Option<String> {
+        TASK_CONTEXT.try_with(|ctx| ctx.task_id.clone()).ok()
+    }
+
+    pub fn get_consumer() -> Option<String> {
+        PROCESS_CONSUMER.get().cloned()
+    }
+
+    pub fn get_job_type() -> Option<String> {
+        PROCESS_JOB_TYPE.get().cloned()
+    }
 
     pub enum TrackedTasksState {
         JobStopping,
@@ -259,8 +272,13 @@ pub mod in_task_context {
     pub async fn add_task(task_type: &str, data: &[u8], track: bool) -> Jcr<()> {
         let task_context = TASK_CONTEXT.get();
         let mut conn = task_context.conn;
-        let job_type = &task_context.job_type;
-        let job_id = &task_context.job_id; // 6. Grab a reference since it's a String now
+
+        // Fetch job_type from the process-wide lock instead of context
+        let job_type = PROCESS_JOB_TYPE
+            .get()
+            .expect("PROCESS_JOB_TYPE must be set");
+
+        let job_id = &task_context.job_id;
         let stream = stream_key(job_type, job_id, task_type);
         let stats_key = job_stats_key(job_type, job_id);
         let mut p = pipe();
@@ -296,8 +314,12 @@ pub mod in_task_context {
 
     pub async fn job_is_stopping() -> Jcr<bool> {
         let mut task_context = TASK_CONTEXT.get();
+        let job_type = PROCESS_JOB_TYPE
+            .get()
+            .expect("PROCESS_JOB_TYPE must be set");
+
         Ok(cmd("SISMEMBER")
-            .arg(stopping_job_ids_key(&task_context.job_type))
+            .arg(stopping_job_ids_key(job_type))
             .arg(&task_context.job_id)
             .query_async(&mut task_context.conn)
             .await?)
@@ -308,9 +330,13 @@ pub mod in_task_context {
             return Ok(TrackedTasksState::JobStopping); // no tracking if job is stopping
         }
         let mut task_context = TASK_CONTEXT.get();
+        let job_type = PROCESS_JOB_TYPE
+            .get()
+            .expect("PROCESS_JOB_TYPE must be set");
+
         // tracked subtasks have been tagged with span value == this_task_id
         let task_count: Option<String> = cmd("HGET")
-            .arg(job_spans_key(&task_context.job_type, &task_context.job_id))
+            .arg(job_spans_key(job_type, &task_context.job_id))
             .arg(&task_context.task_id)
             .query_async(&mut task_context.conn)
             .await?;

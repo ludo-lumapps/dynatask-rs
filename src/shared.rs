@@ -2,10 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::env::var;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::OnceLock;
 
 use redis::aio::ConnectionManager;
 use redis::{RedisError, ToRedisArgs, cmd};
 use tokio::task_local;
+
+pub static PROCESS_CONSUMER: OnceLock<String> = OnceLock::new();
+pub static PROCESS_JOB_TYPE: OnceLock<String> = OnceLock::new();
+pub static PROCESS_LOCAL_TASK_TYPE: OnceLock<String> = OnceLock::new();
 
 pub(crate) type JobTaskIds<T> = HashMap<T, Vec<String>>;
 pub(crate) static GROUP: &str = "group-1";
@@ -141,28 +146,22 @@ impl WorkConfBuilder {
 #[derive(Clone)]
 pub(crate) struct TaskContext {
     pub conn: ConnectionManager,
-    pub job_type: String,
     pub job_id: String,
     pub task_id: String,
-    pub task_type: String,
     pub spans: Option<Vec<String>>,
 }
 
 impl TaskContext {
     pub fn new<T: Display>(
         conn: ConnectionManager,
-        job_type: String,
         job_id: T,
         task_id: String,
-        task_type: String,
         spans: Option<Vec<String>>,
     ) -> Self {
         Self {
             conn,
-            job_type,
             job_id: job_id.to_string(),
             task_id,
-            task_type,
             spans,
         }
     }

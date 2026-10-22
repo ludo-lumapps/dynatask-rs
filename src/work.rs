@@ -14,7 +14,9 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::global_monitor::{FinishedJobInfo, GlobalMonitor};
 use crate::local_monitor::LocalMonitor;
-use crate::shared::{JobTaskIds, WorkConf};
+use crate::shared::{
+    JobTaskIds, PROCESS_CONSUMER, PROCESS_JOB_TYPE, PROCESS_LOCAL_TASK_TYPE, WorkConf,
+};
 use crate::workers::{JobTaskError, WorkDispatcher};
 
 /// Starts the different tasks to process jobs
@@ -32,6 +34,9 @@ pub async fn start_work<T, FTaskHandler, FutTaskHandler, FJobIsDone, FutJobIsDon
     FJobIsDone: (Fn(FinishedJobInfo<T>) -> FutJobIsDone) + Send + Sync + 'static,
     FutJobIsDone: Future<Output = ()> + Send + 'static,
 {
+    let _ = PROCESS_JOB_TYPE.set(conf.job_type.clone());
+    let _ = PROCESS_CONSUMER.set(conf.consumer.clone());
+    let _ = PROCESS_LOCAL_TASK_TYPE.set(conf.local_task_type.clone());
     let job_type = &conf.job_type;
     let task_type = &conf.local_task_type;
     info!("Starting [{job_type}] processing [{task_type}] tasks");
@@ -75,14 +80,7 @@ pub async fn start_work<T, FTaskHandler, FutTaskHandler, FJobIsDone, FutJobIsDon
     };
     let running_tasks = Arc::new(Mutex::new(JobTaskIds::<T>::new()));
     let local_monitor_handle = {
-        let local_monitor = LocalMonitor::new(
-            &conf.valkey_uri,
-            job_type.clone(),
-            task_type.clone(),
-            conf.consumer.clone(),
-            running_tasks.clone(),
-        )
-        .await;
+        let local_monitor = LocalMonitor::new(&conf.valkey_uri, running_tasks.clone()).await;
         let exit_flag = exit_flag.clone();
         spawn(async move { local_monitor.start(exit_flag).await })
     };
